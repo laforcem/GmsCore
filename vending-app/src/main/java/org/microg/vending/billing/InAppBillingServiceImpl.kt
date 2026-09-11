@@ -53,6 +53,12 @@ private class BuyFlowCacheEntry(
 
 private const val EXPIRE_MS = 1 * 60 * 1000
 
+// Google's documented INAPP_PURCHASE_DATA purchaseState values: 0=Purchased, 1=Canceled, 2=Pending.
+// This is intentionally distinct from the "4" sentinel checked against PurchaseItem.purchaseState
+// in getPurchasesExtraParams' enablePendingPurchases filter below — that existing magic number's
+// exact origin/meaning is undocumented elsewhere in this codebase and is left as-is here.
+private const val HISTORY_PURCHASE_STATE_PURCHASED = 0
+
 private data class IAPCoreCacheEntry(
     val iapCore: IAPCore,
     val expiredAt: Long
@@ -432,6 +438,76 @@ class InAppBillingServiceImpl(private val context: Context) : IInAppBillingServi
         return result.getInt("RESPONSE_CODE")
     }
 
+    // History reflects Google's most recent record regardless of consumption/refund/pending
+    // status, so only a strict "Purchased" state is accepted here; anything else, or unparseable
+    // JSON, returns null rather than risk granting a false entitlement.
+    private fun buildOwnedPurchaseItemFromHistory(
+        packageName: String,
+        type: String,
+        historyItem: GetPurchaseHistoryResult.PurchaseHistoryItem
+    ): PurchaseItem? {
+        val jdo = try {
+            JSONObject(historyItem.jsonData)
+        } catch (e: Exception) {
+            Log.w(TAG, "buildOwnedPurchaseItemFromHistory: failed to parse purchase history JSON for sku=${historyItem.sku}", e)
+            return null
+        }
+        val purchaseState = jdo.optInt("purchaseState", -1)
+        if (purchaseState != HISTORY_PURCHASE_STATE_PURCHASED) {
+            Log.d(TAG, "buildOwnedPurchaseItemFromHistory: ignoring non-purchased history item sku=${historyItem.sku} purchaseState=$purchaseState")
+            return null
+        }
+        // purchaseToken is required to cache into purchase.db (PRIMARY KEY) but not to answer this
+        // call, so a missing token still yields an item, just one that callers below must not cache.
+        val purchaseToken = jdo.optString("purchaseToken").takeIf { it.isNotBlank() } ?: ""
+        return PurchaseItem(
+            type = type,
+            sku = historyItem.sku,
+            pkgName = packageName,
+            purchaseToken = purchaseToken,
+            purchaseState = purchaseState,
+            jsonData = historyItem.jsonData,
+            signature = historyItem.signature
+        )
+    }
+
+    // INAPP only: PurchaseHistoryItem carries no subscription expiry, so a fallback-built "subs"
+    // item would default expireAt=0 and be filtered out as already-expired by the caller below.
+    private fun queryOwnedPurchasesFromHistory(
+        apiVersion: Int,
+        packageName: String,
+        type: String,
+        account: Account
+    ): List<PurchaseItem> {
+        val params = GetPurchaseHistoryParams(
+            apiVersion = apiVersion,
+            type = type,
+            continuationToken = null,
+            extraParams = emptyMap()
+        )
+        val coreResult = try {
+            val deferred = CoroutineScope(Dispatchers.IO).async {
+                createIAPCore(context, account, packageName).getPurchaseHistory(params)
+            }
+            runBlocking {
+                deferred.await()
+            }
+        } catch (e: RuntimeException) {
+            Log.w(TAG, "queryOwnedPurchasesFromHistory: purchase history fallback unavailable: ${e.message}")
+            return emptyList()
+        } catch (e: Exception) {
+            Log.e(TAG, "queryOwnedPurchasesFromHistory: purchase history fallback failed", e)
+            return emptyList()
+        }
+        if (coreResult.getCode() != BillingResponseCode.OK) {
+            Log.w(TAG, "queryOwnedPurchasesFromHistory: purchase history fallback returned code ${coreResult.getCode()}")
+            return emptyList()
+        }
+        return coreResult.purchaseHistoryList.orEmpty().mapNotNull {
+            buildOwnedPurchaseItemFromHistory(packageName, type, it)
+        }
+    }
+
     override fun getPurchasesExtraParams(
         apiVersion: Int,
         packageName: String?,
@@ -454,13 +530,26 @@ class InAppBillingServiceImpl(private val context: Context) : IInAppBillingServi
             return resultBundle(BillingResponseCode.BILLING_UNAVAILABLE, e.message)
         }
         val enablePendingPurchases = extraParams?.getBoolean("enablePendingPurchases", false) ?: false
+        var purchases = PurchaseManager.queryPurchases(account, packageName!!, type!!).filter {
+            if (it.type == "subs" && it.expireAt < System.currentTimeMillis()) return@filter false
+            true
+        }
+        if (purchases.isEmpty() && type == ProductType.INAPP) {
+            Log.d(TAG, "getPurchasesExtraParams: no local purchases for packageName=$packageName type=$type, falling back to purchase history")
+            val historyPurchases = queryOwnedPurchasesFromHistory(apiVersion, packageName, type, account)
+            historyPurchases.forEach {
+                if (it.purchaseToken.isNotBlank()) {
+                    PurchaseManager.addPurchase(account, packageName, it)
+                } else {
+                    Log.w(TAG, "getPurchasesExtraParams: history item sku=${it.sku} has no purchaseToken, not caching")
+                }
+            }
+            purchases = historyPurchases
+        }
         val itemList = ArrayList<String>()
         val dataList = ArrayList<String>()
         val signatureList = ArrayList<String>()
-        PurchaseManager.queryPurchases(account, packageName!!, type!!).filter {
-            if (it.type == "subs" && it.expireAt < System.currentTimeMillis()) return@filter false
-            true
-        }.forEach {
+        purchases.forEach {
             if (enablePendingPurchases || it.purchaseState != 4) {
                 itemList.add(it.sku)
                 dataList.add(it.jsonData)
